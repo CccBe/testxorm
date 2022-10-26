@@ -244,6 +244,190 @@ func (session *Session) insertMultipleStruct(rowsSlicePtr interface{}) (int64, e
 	return res.RowsAffected()
 }
 
+func (session *Session) replaceMultipleStruct(rowsSlicePtr interface{}) (int64, error) {
+	sliceValue := reflect.Indirect(reflect.ValueOf(rowsSlicePtr))
+	if sliceValue.Kind() != reflect.Slice {
+		return 0, errors.New("needs a pointer to a slice")
+	}
+
+	if sliceValue.Len() <= 0 {
+		return 0, ErrNoElementsOnSlice
+	}
+
+	if err := session.statement.SetRefBean(sliceValue.Index(0).Interface()); err != nil {
+		return 0, err
+	}
+
+	tableName := session.statement.TableName()
+	if len(tableName) == 0 {
+		return 0, ErrTableNotFound
+	}
+
+	var (
+		table          = session.statement.RefTable
+		size           = sliceValue.Len()
+		colNames       []string
+		colMultiPlaces []string
+		args           []interface{}
+	)
+
+	for i := 0; i < size; i++ {
+		v := sliceValue.Index(i)
+		var vv reflect.Value
+		switch v.Kind() {
+		case reflect.Interface:
+			vv = reflect.Indirect(v.Elem())
+		default:
+			vv = reflect.Indirect(v)
+		}
+		elemValue := v.Interface()
+		var colPlaces []string
+
+		// handle BeforeInsertProcessor
+		// !nashtsai! does user expect it's same slice to passed closure when using Before()/After() when insert multi??
+		for _, closure := range session.beforeClosures {
+			closure(elemValue)
+		}
+
+		if processor, ok := interface{}(elemValue).(BeforeInsertProcessor); ok {
+			processor.BeforeInsert()
+		}
+		// --
+
+		for _, col := range table.Columns() {
+			ptrFieldValue, err := col.ValueOfV(&vv)
+			if err != nil {
+				return 0, err
+			}
+			fieldValue := *ptrFieldValue
+			if col.IsAutoIncrement && utils.IsZero(fieldValue.Interface()) {
+				if session.engine.dialect.Features().AutoincrMode == dialects.SequenceAutoincrMode {
+					if i == 0 {
+						colNames = append(colNames, col.Name)
+					}
+					colPlaces = append(colPlaces, utils.SeqName(tableName)+".nextval")
+				}
+				continue
+			}
+			if col.MapType == schemas.ONLYFROMDB {
+				continue
+			}
+			if col.IsDeleted {
+				continue
+			}
+			if session.statement.OmitColumnMap.Contain(col.Name) {
+				continue
+			}
+			if len(session.statement.ColumnMap) > 0 && !session.statement.ColumnMap.Contain(col.Name) {
+				continue
+			}
+			// !satorunooshie! set fieldValue as nil when column is nullable and zero-value
+			if _, ok := getFlagForColumn(session.statement.NullableMap, col); ok {
+				if col.Nullable && utils.IsValueZero(fieldValue) {
+					var nilValue *int
+					fieldValue = reflect.ValueOf(nilValue)
+				}
+			}
+			if (col.IsCreated || col.IsUpdated) && session.statement.UseAutoTime {
+				val, t, err := session.engine.nowTime(col)
+				if err != nil {
+					return 0, err
+				}
+				args = append(args, val)
+
+				var colName = col.Name
+				session.afterClosures = append(session.afterClosures, func(bean interface{}) {
+					col := table.GetColumn(colName)
+					setColumnTime(bean, col, t)
+				})
+			} else if col.IsVersion && session.statement.CheckVersion {
+				args = append(args, 1)
+				var colName = col.Name
+				session.afterClosures = append(session.afterClosures, func(bean interface{}) {
+					col := table.GetColumn(colName)
+					setColumnInt(bean, col, 1)
+				})
+			} else {
+				arg, err := session.statement.Value2Interface(col, fieldValue)
+				if err != nil {
+					return 0, err
+				}
+				args = append(args, arg)
+			}
+
+			if i == 0 {
+				colNames = append(colNames, col.Name)
+			}
+			colPlaces = append(colPlaces, "?")
+		}
+
+		colMultiPlaces = append(colMultiPlaces, strings.Join(colPlaces, ", "))
+	}
+	cleanupProcessorsClosures(&session.beforeClosures)
+
+	quoter := session.engine.dialect.Quoter()
+	var sql string
+	colStr := quoter.Join(colNames, ",")
+	if session.engine.dialect.URI().DBType == schemas.ORACLE {
+		temp := fmt.Sprintf(") INTO %s (%v) VALUES (",
+			quoter.Quote(tableName),
+			colStr)
+		sql = fmt.Sprintf("INSERT ALL INTO %s (%v) VALUES (%v) SELECT 1 FROM DUAL",
+			quoter.Quote(tableName),
+			colStr,
+			strings.Join(colMultiPlaces, temp))
+	} else if session.engine.dialect.URI().DBType == schemas.MYSQL {
+		sql = fmt.Sprintf("REPLACE INTO %s (%v) VALUES (%v)",
+			quoter.Quote(tableName),
+			colStr,
+			strings.Join(colMultiPlaces, "),("))
+	} else {
+		sql = fmt.Sprintf("INSERT INTO %s (%v) VALUES (%v)",
+			quoter.Quote(tableName),
+			colStr,
+			strings.Join(colMultiPlaces, "),("))
+	}
+	res, err := session.exec(sql, args...)
+	if err != nil {
+		return 0, err
+	}
+
+	_ = session.cacheInsert(tableName)
+
+	lenAfterClosures := len(session.afterClosures)
+	for i := 0; i < size; i++ {
+		elemValue := reflect.Indirect(sliceValue.Index(i)).Addr().Interface()
+
+		// handle AfterInsertProcessor
+		if session.isAutoCommit {
+			// !nashtsai! does user expect it's same slice to passed closure when using Before()/After() when insert multi??
+			for _, closure := range session.afterClosures {
+				closure(elemValue)
+			}
+			if processor, ok := elemValue.(AfterInsertProcessor); ok {
+				processor.AfterInsert()
+			}
+		} else {
+			if lenAfterClosures > 0 {
+				if value, has := session.afterInsertBeans[elemValue]; has && value != nil {
+					*value = append(*value, session.afterClosures...)
+				} else {
+					afterClosures := make([]func(interface{}), lenAfterClosures)
+					copy(afterClosures, session.afterClosures)
+					session.afterInsertBeans[elemValue] = &afterClosures
+				}
+			} else {
+				if _, ok := elemValue.(AfterInsertProcessor); ok {
+					session.afterInsertBeans[elemValue] = nil
+				}
+			}
+		}
+	}
+
+	cleanupProcessorsClosures(&session.afterClosures)
+	return res.RowsAffected()
+}
+
 // InsertMulti insert multiple records
 func (session *Session) InsertMulti(rowsSlicePtr interface{}) (int64, error) {
 	if session.isAutoClose {
@@ -256,6 +440,19 @@ func (session *Session) InsertMulti(rowsSlicePtr interface{}) (int64, error) {
 	}
 
 	return session.insertMultipleStruct(rowsSlicePtr)
+}
+
+func (session *Session) ReplaceInsertMulti(rowsSlicePtr interface{}) (int64, error) {
+	if session.isAutoClose {
+		defer session.Close()
+	}
+
+	sliceValue := reflect.Indirect(reflect.ValueOf(rowsSlicePtr))
+	if sliceValue.Kind() != reflect.Slice {
+		return 0, ErrPtrSliceType
+	}
+
+	return session.replaceMultipleStruct(rowsSlicePtr)
 }
 
 func (session *Session) insertStruct(bean interface{}) (int64, error) {
